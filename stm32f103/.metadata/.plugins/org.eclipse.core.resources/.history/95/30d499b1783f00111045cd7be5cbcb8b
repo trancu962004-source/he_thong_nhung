@@ -1,0 +1,307 @@
+#include "main.h"
+#include "cmsis_os.h"
+#include "queue.h"
+#include "stdio.h"
+#include "stdlib.h"
+#include "CLCD_I2C.h"
+#include "rps_symbols.h"
+
+/********************************************
+Check/Add in FreeRTOSConfig.h:
+#define configUSE_COUNTING_SEMAPHORES     1
+#define configUSE_MUTEXES                 1
+#define configUSE_TIMERS                  1
+#define configUSE_TASK_NOTIFICATIONS      1
+********************************************/
+
+typedef enum {START, PLAYING, LEVEL_WIN, LEVEL_LOSE, ENDGAME} gameSTATE;
+typedef enum {NONE = 0xFF, ROCK = 0, PAPER = 1, SCISSORS = 2} rpsMOVE;
+typedef struct {uint32_t level, round, win, lose, draw, timeout; gameSTATE state;} gameINFO;
+
+I2C_HandleTypeDef hi2c1;
+CLCD_I2C_Name LCD1;
+char lcd_text[20];
+
+gameINFO mygame = {1, 0, 0, 0, 0, 0, START};
+rpsMOVE machine_list[10];
+rpsMOVE player_list[10];
+
+static void MX_GPIO_Init(void);
+static void MX_I2C1_Init(void);
+void SystemClock_Config(void);
+void check_LCD_address(I2C_HandleTypeDef *hi2c, const uint8_t addr, int trails, int timeout);
+void task_lcd(void * params);
+void task_button(void * params);
+void task_game(void * params);
+void timer_input_callback(TimerHandle_t xTimer);
+
+TaskHandle_t button_handle, game_handle, lcd_handle;
+TimerHandle_t input_timer_hd;
+QueueHandle_t qmachine_hd, qplayer_hd;
+SemaphoreHandle_t dataMutex, taskLCD_sem, round_sem;
+
+static uint32_t btn_to_move(uint32_t code){
+  if(code == 0x0001) return ROCK;
+  if(code == 0x0008) return PAPER;
+  if(code == 0x0040) return SCISSORS;
+  return NONE;
+}
+
+static uint8_t move_to_char(rpsMOVE move){
+  if(move == ROCK) return RPS_ROCK;
+  if(move == PAPER) return RPS_PAPER;
+  if(move == SCISSORS) return RPS_SCISSORS;
+  return RPS_UNKNOWN;
+}
+
+static int player_result(rpsMOVE player, rpsMOVE machine){
+  if(player == machine) return 0;
+  if((player == ROCK && machine == SCISSORS) ||
+     (player == PAPER && machine == ROCK) ||
+     (player == SCISSORS && machine == PAPER)) return 1;
+  return -1;
+}
+
+static void reset_game(uint32_t next_level){
+  mygame.level = next_level;
+  mygame.round = 0;
+  mygame.win = 0;
+  mygame.lose = 0;
+  mygame.draw = 0;
+  mygame.timeout = 0;
+  mygame.state = PLAYING;
+  for(int i = 0; i < 10; i++){
+    machine_list[i] = NONE;
+    player_list[i] = NONE;
+  }
+  xQueueReset(qmachine_hd);
+  xQueueReset(qplayer_hd);
+  for(int i = 0; i < 10; i++) xSemaphoreGive(round_sem);
+  xTimerChangePeriod(input_timer_hd, pdMS_TO_TICKS(4000 - (mygame.level - 1) * 250), 0);
+  xTimerStart(input_timer_hd, 0);
+}
+
+int main(void){
+  HAL_Init();
+  SystemClock_Config();
+  MX_GPIO_Init();
+  MX_I2C1_Init();
+
+  check_LCD_address(&hi2c1, 0x4E, 3, 100);
+  CLCD_I2C_Init(&LCD1, &hi2c1, 0x4E, 16, 2);
+
+  dataMutex = xSemaphoreCreateMutex();
+  taskLCD_sem = xSemaphoreCreateBinary();
+  round_sem = xSemaphoreCreateCounting(10, 0);
+  qmachine_hd = xQueueCreate(10, sizeof(uint32_t));
+  qplayer_hd = xQueueCreate(10, sizeof(uint32_t));
+
+  input_timer_hd = xTimerCreate("input timer", pdMS_TO_TICKS(4000), pdFALSE, NULL, timer_input_callback);
+
+  xTaskCreate(task_lcd, "LCD task", 160, NULL, 2, &lcd_handle);
+  xTaskCreate(task_button, "Button task", 160, NULL, 3, &button_handle);
+  xTaskCreate(task_game, "Game task", 160, NULL, 2, &game_handle);
+
+  osKernelStart();
+  while(1){}
+}
+
+void timer_input_callback(TimerHandle_t xTimer){
+  uint32_t code = 0xFFFFFFFF;
+  xQueueSend(qplayer_hd, &code, 0);
+}
+
+void task_game(void * params){
+  uint32_t player, machine;
+  srand(HAL_GetTick());
+  xSemaphoreGive(taskLCD_sem);
+  for(;;){
+    xQueueReceive(qplayer_hd, &player, portMAX_DELAY);
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    if(mygame.state != PLAYING){
+      reset_game(mygame.level);
+      xSemaphoreGive(dataMutex);
+      xSemaphoreGive(taskLCD_sem);
+      continue;
+    }
+    if(xSemaphoreTake(round_sem, 0) == pdFALSE){
+      xSemaphoreGive(dataMutex);
+      continue;
+    }
+    machine = rand() % 3;
+    xQueueSend(qmachine_hd, &machine, 0);
+    machine_list[mygame.round] = (rpsMOVE)machine;
+    if(player == 0xFFFFFFFF || btn_to_move(player) == NONE){
+      player_list[mygame.round] = NONE;
+      mygame.timeout++;
+      mygame.lose++;
+    }else{
+      player = btn_to_move(player);
+      player_list[mygame.round] = (rpsMOVE)player;
+      int r = player_result((rpsMOVE)player, (rpsMOVE)machine);
+      if(r > 0) mygame.win++;
+      else if(r < 0) mygame.lose++;
+      else mygame.draw++;
+    }
+    mygame.round++;
+    if(mygame.round >= 10){
+      xTimerStop(input_timer_hd, 0);
+      if(mygame.win >= mygame.lose){
+        mygame.state = LEVEL_WIN;
+        mygame.level++;
+      }else{
+        mygame.state = LEVEL_LOSE;
+      }
+    }else{
+      xTimerReset(input_timer_hd, 0);
+    }
+    xSemaphoreGive(dataMutex);
+    xSemaphoreGive(taskLCD_sem);
+  }
+}
+
+void task_button(void * params){
+  uint32_t code;
+  for(;;){
+    xTaskNotifyWait(0, 0xFFFFFFFF, &code, portMAX_DELAY);
+    xQueueSend(qplayer_hd, &code, portMAX_DELAY);
+  }
+}
+
+void task_lcd(void* params){
+  CLCD_I2C_CreateChar(&LCD1, RPS_ROCK, RPS_rock);
+  CLCD_I2C_CreateChar(&LCD1, RPS_PAPER, RPS_paper);
+  CLCD_I2C_CreateChar(&LCD1, RPS_SCISSORS, RPS_scissors);
+  CLCD_I2C_CreateChar(&LCD1, RPS_UNKNOWN, RPS_unknown);
+  CLCD_I2C_CreateChar(&LCD1, RPS_EMPTY, RPS_empty);
+  CLCD_I2C_CreateChar(&LCD1, RPS_WIN, RPS_win);
+  CLCD_I2C_CreateChar(&LCD1, RPS_LOSE, RPS_lose);
+  CLCD_I2C_CreateChar(&LCD1, RPS_DRAW, RPS_draw);
+  for(;;){
+    xSemaphoreTake(taskLCD_sem, portMAX_DELAY);
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    gameINFO g = mygame;
+    rpsMOVE m[10], p[10];
+    for(int i = 0; i < 10; i++){m[i] = machine_list[i]; p[i] = player_list[i];}
+    xSemaphoreGive(dataMutex);
+
+    CLCD_I2C_Clear(&LCD1);
+    if(g.state == START){
+      CLCD_I2C_SetCursor(&LCD1, 0, 0);
+      CLCD_I2C_WriteString(&LCD1, " KEO BUA BAO");
+      CLCD_I2C_SetCursor(&LCD1, 0, 1);
+      CLCD_I2C_WriteString(&LCD1, " NHAN DE CHOI");
+    }else if(g.state == PLAYING){
+      CLCD_I2C_SetCursor(&LCD1, 0, 0);
+      sprintf(lcd_text, "L%02d R%02d W%02d", (int)g.level, (int)(g.round + 1), (int)g.win);
+      CLCD_I2C_WriteString(&LCD1, lcd_text);
+      CLCD_I2C_SetCursor(&LCD1, 0, 1);
+      for(int i = 0; i < 10; i++) CLCD_I2C_WriteChar(&LCD1, i < g.round ? move_to_char(p[i]) : RPS_UNKNOWN);
+      CLCD_I2C_WriteString(&LCD1, " ");
+      for(int i = 0; i < 5; i++) CLCD_I2C_WriteChar(&LCD1, i < g.round ? move_to_char(m[i]) : RPS_EMPTY);
+    }else{
+      CLCD_I2C_SetCursor(&LCD1, 0, 0);
+      if(g.state == LEVEL_WIN) CLCD_I2C_WriteString(&LCD1, " WIN NEXT LEVEL");
+      else CLCD_I2C_WriteString(&LCD1, " LOSE REPLAY");
+      CLCD_I2C_SetCursor(&LCD1, 0, 1);
+      sprintf(lcd_text, "W%d L%d D%d T%d", (int)g.win, (int)g.lose, (int)g.draw, (int)g.timeout);
+      CLCD_I2C_WriteString(&LCD1, lcd_text);
+    }
+  }
+}
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin){
+  BaseType_t xHPTW = pdFALSE;
+  static uint32_t last_tick = 0;
+  uint32_t now = xTaskGetTickCountFromISR();
+  if(now - last_tick > pdMS_TO_TICKS(150)){
+    last_tick = now;
+    uint32_t code = 0;
+    if(GPIO_Pin == GPIO_PIN_14) code = 0x0001;
+    else if(GPIO_Pin == GPIO_PIN_10) code = 0x0008;
+    else if(GPIO_Pin == GPIO_PIN_15) code = 0x0040;
+    if(code != 0) xTaskNotifyFromISR(button_handle, code, eSetValueWithOverwrite, &xHPTW);
+    portYIELD_FROM_ISR(xHPTW);
+  }
+}
+
+void EXTI15_10_IRQHandler(void){
+  if(__HAL_GPIO_EXTI_GET_IT(GPIO_PIN_10)) HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_10);
+  if(__HAL_GPIO_EXTI_GET_IT(GPIO_PIN_14)) HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_14);
+  if(__HAL_GPIO_EXTI_GET_IT(GPIO_PIN_15)) HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_15);
+}
+
+void check_LCD_address(I2C_HandleTypeDef *hi2c, const uint8_t addr, int trails, int timeout){
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
+  if(HAL_I2C_IsDeviceReady(hi2c, addr, trails, timeout) == HAL_OK){
+    for(int i = 0; i < 20; i++){HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13); HAL_Delay(50);}
+  }else{
+    for(int i = 0; i < 6; i++){HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13); HAL_Delay(500);}
+  }
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
+}
+
+void SystemClock_Config(void){
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+  if(HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) Error_Handler();
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK|RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+  if(HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK) Error_Handler();
+}
+
+static void MX_I2C1_Init(void){
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.ClockSpeed = 100000;
+  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if(HAL_I2C_Init(&hi2c1) != HAL_OK) Error_Handler();
+}
+
+static void MX_GPIO_Init(void){
+  GPIO_InitTypeDef InitStruct = {0};
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+  InitStruct.Pin = GPIO_PIN_13;
+  InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  InitStruct.Pull = GPIO_NOPULL;
+  InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOC, &InitStruct);
+
+  InitStruct.Pin = GPIO_PIN_10 | GPIO_PIN_15;
+  InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOA, &InitStruct);
+
+  InitStruct.Pin = GPIO_PIN_14;
+  InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOB, &InitStruct);
+
+  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+}
+
+void Error_Handler(void){
+  __disable_irq();
+  while(1){}
+}
+
+#ifdef USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line){}
+#endif

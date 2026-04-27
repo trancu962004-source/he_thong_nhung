@@ -1,0 +1,548 @@
+#include "main.h"
+#include "cmsis_os.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include "queue.h"
+#include "semphr.h"
+#include "timers.h"
+
+#include "stdio.h"
+#include "stdlib.h"
+#include "string.h"
+#include "CLCD_I2C.h"
+
+/* =========================================================
+   RPS GAME - KEO BUA BAO
+   LCD I2C 16x2
+
+   Button mapping:
+   PB14 = KEO
+   PA10 = BUA
+   PA15 = BAO / START / NEXT
+
+   Neu LCD chi dung o "RPS GAME" thi RTOS chua chay.
+   Hay tang configTOTAL_HEAP_SIZE trong FreeRTOSConfig.h len 8192/10240.
+   ========================================================= */
+
+#define LCD_ADDR        0x4E    // LCD 0x27 -> 0x4E. Neu LCD 0x3F -> doi thanh 0x7E
+#define TOTAL_ROUNDS    10
+#define ROUND_TIME_SEC  5
+
+#define BTN_KEO         0
+#define BTN_BUA         1
+#define BTN_BAO         2
+#define BTN_INVALID     0xFF
+
+typedef enum {
+    STATE_START = 0,
+    STATE_PLAYING,
+    STATE_SHOW_RESULT,
+    STATE_FINISH
+} GameState;
+
+typedef enum {
+    RPS_NONE = 0,
+    RPS_KEO,
+    RPS_BUA,
+    RPS_BAO
+} RpsChoice;
+
+typedef struct {
+    GameState state;
+    uint32_t round;
+    uint32_t score_user;
+    uint32_t score_cpu;
+    uint32_t time_left;
+    RpsChoice user_choice;
+    RpsChoice cpu_choice;
+    int last_result;     // 1 win, 0 draw, -1 lose
+} GameData;
+
+I2C_HandleTypeDef hi2c1;
+CLCD_I2C_Name LCD1;
+
+static void MX_GPIO_Init(void);
+static void MX_I2C1_Init(void);
+void SystemClock_Config(void);
+void Error_Handler(void);
+
+void task_lcd(void *params);
+void task_button(void *params);
+void task_game(void *params);
+void timer_game_callback(TimerHandle_t xTimer);
+void check_LCD_address(I2C_HandleTypeDef *hi2c, const uint8_t addr, int trials, int timeout);
+
+TaskHandle_t lcd_handle;
+TaskHandle_t button_handle;
+TaskHandle_t game_handle;
+
+QueueHandle_t qbutton_hd;
+SemaphoreHandle_t lcd_sem;
+SemaphoreHandle_t game_sem;
+SemaphoreHandle_t data_mutex;
+TimerHandle_t game_timer_hd;
+
+static GameData game = {
+    STATE_START,
+    0,
+    0,
+    0,
+    ROUND_TIME_SEC,
+    RPS_NONE,
+    RPS_NONE,
+    0
+};
+
+static const char *choice_text(RpsChoice c)
+{
+    switch (c) {
+        case RPS_KEO: return "KEO";
+        case RPS_BUA: return "BUA";
+        case RPS_BAO: return "BAO";
+        default:      return "---";
+    }
+}
+
+static RpsChoice btn_to_choice(uint32_t btn)
+{
+    if (btn == BTN_KEO) return RPS_KEO;
+    if (btn == BTN_BUA) return RPS_BUA;
+    if (btn == BTN_BAO) return RPS_BAO;
+    return RPS_NONE;
+}
+
+static RpsChoice random_cpu_choice(void)
+{
+    uint32_t r = rand() % 3;
+    if (r == 0) return RPS_KEO;
+    if (r == 1) return RPS_BUA;
+    return RPS_BAO;
+}
+
+static int judge_rps(RpsChoice user, RpsChoice cpu)
+{
+    if (user == cpu) return 0;
+    if ((user == RPS_KEO && cpu == RPS_BAO) ||
+        (user == RPS_BUA && cpu == RPS_KEO) ||
+        (user == RPS_BAO && cpu == RPS_BUA)) {
+        return 1;
+    }
+    return -1;
+}
+
+static void start_new_game(void)
+{
+    xSemaphoreTake(data_mutex, portMAX_DELAY);
+    game.state = STATE_PLAYING;
+    game.round = 1;
+    game.score_user = 0;
+    game.score_cpu = 0;
+    game.time_left = ROUND_TIME_SEC;
+    game.user_choice = RPS_NONE;
+    game.cpu_choice = RPS_NONE;
+    game.last_result = 0;
+    xSemaphoreGive(data_mutex);
+
+    xTimerStop(game_timer_hd, 0);
+    xTimerChangePeriod(game_timer_hd, pdMS_TO_TICKS(1000), 0);
+    xTimerStart(game_timer_hd, 0);
+
+    xSemaphoreGive(lcd_sem);
+}
+
+static void next_round_or_finish(void)
+{
+    xSemaphoreTake(data_mutex, portMAX_DELAY);
+
+    if (game.round >= TOTAL_ROUNDS) {
+        game.state = STATE_FINISH;
+        xTimerStop(game_timer_hd, 0);
+    } else {
+        game.round++;
+        game.state = STATE_PLAYING;
+        game.time_left = ROUND_TIME_SEC;
+        game.user_choice = RPS_NONE;
+        game.cpu_choice = RPS_NONE;
+        game.last_result = 0;
+
+        xTimerStop(game_timer_hd, 0);
+        xTimerChangePeriod(game_timer_hd, pdMS_TO_TICKS(1000), 0);
+        xTimerStart(game_timer_hd, 0);
+    }
+
+    xSemaphoreGive(data_mutex);
+    xSemaphoreGive(lcd_sem);
+}
+
+static void finish_round(RpsChoice user_choice)
+{
+    xSemaphoreTake(data_mutex, portMAX_DELAY);
+
+    if (game.state == STATE_PLAYING) {
+        game.user_choice = user_choice;
+        game.cpu_choice = random_cpu_choice();
+        game.last_result = judge_rps(game.user_choice, game.cpu_choice);
+
+        if (game.last_result > 0) game.score_user++;
+        else if (game.last_result < 0) game.score_cpu++;
+
+        game.state = STATE_SHOW_RESULT;
+        xTimerStop(game_timer_hd, 0);
+    }
+
+    xSemaphoreGive(data_mutex);
+    xSemaphoreGive(lcd_sem);
+}
+
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_I2C1_Init();
+
+    check_LCD_address(&hi2c1, LCD_ADDR, 3, 100);
+    CLCD_I2C_Init(&LCD1, &hi2c1, LCD_ADDR, 16, 2);
+
+    // Test LCD truoc khi vao RTOS
+    CLCD_I2C_Clear(&LCD1);
+    CLCD_I2C_SetCursor(&LCD1, 0, 0);
+    CLCD_I2C_WriteString(&LCD1, "LCD OK");
+    CLCD_I2C_SetCursor(&LCD1, 0, 1);
+    CLCD_I2C_WriteString(&LCD1, "RPS GAME");
+    HAL_Delay(1000);
+
+    qbutton_hd = xQueueCreate(10, sizeof(uint32_t));
+    lcd_sem = xSemaphoreCreateBinary();
+    game_sem = xSemaphoreCreateBinary();
+    data_mutex = xSemaphoreCreateMutex();
+
+    game_timer_hd = xTimerCreate("game timer",
+                                 pdMS_TO_TICKS(1000),
+                                 pdTRUE,
+                                 NULL,
+                                 timer_game_callback);
+
+    if (qbutton_hd == NULL || lcd_sem == NULL || game_sem == NULL ||
+        data_mutex == NULL || game_timer_hd == NULL) {
+        CLCD_I2C_Clear(&LCD1);
+        CLCD_I2C_SetCursor(&LCD1, 0, 0);
+        CLCD_I2C_WriteString(&LCD1, "CREATE FAIL");
+        while (1) {
+            HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+            HAL_Delay(300);
+        }
+    }
+
+    BaseType_t ok1 = xTaskCreate(task_lcd,    "LCD",    128, NULL, 2, &lcd_handle);
+    BaseType_t ok2 = xTaskCreate(task_button, "BUTTON", 128, NULL, 3, &button_handle);
+    BaseType_t ok3 = xTaskCreate(task_game,   "GAME",   128, NULL, 2, &game_handle);
+
+    if (ok1 != pdPASS || ok2 != pdPASS || ok3 != pdPASS) {
+        CLCD_I2C_Clear(&LCD1);
+        CLCD_I2C_SetCursor(&LCD1, 0, 0);
+        CLCD_I2C_WriteString(&LCD1, "TASK FAIL");
+        CLCD_I2C_SetCursor(&LCD1, 0, 1);
+        CLCD_I2C_WriteString(&LCD1, "CHECK HEAP");
+        while (1) {
+            HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+            HAL_Delay(300);
+        }
+    }
+
+    // Cho LCD task hien man hinh START ngay khi scheduler chay
+    xSemaphoreGive(lcd_sem);
+
+    CLCD_I2C_Clear(&LCD1);
+    CLCD_I2C_SetCursor(&LCD1, 0, 0);
+    CLCD_I2C_WriteString(&LCD1, "START OS...");
+    HAL_Delay(300);
+
+    vTaskStartScheduler();
+
+    // Neu vao day la scheduler loi, thuong do configTOTAL_HEAP_SIZE qua nho
+    while (1) {
+        CLCD_I2C_Clear(&LCD1);
+        CLCD_I2C_SetCursor(&LCD1, 0, 0);
+        CLCD_I2C_WriteString(&LCD1, "OS START FAIL");
+        CLCD_I2C_SetCursor(&LCD1, 0, 1);
+        CLCD_I2C_WriteString(&LCD1, "CHECK HEAP");
+        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+        HAL_Delay(500);
+    }
+}
+
+void task_lcd(void *params)
+{
+    GameData local;
+    char line[17];
+
+    for (;;) {
+        xSemaphoreTake(lcd_sem, portMAX_DELAY);
+
+        xSemaphoreTake(data_mutex, portMAX_DELAY);
+        local = game;
+        xSemaphoreGive(data_mutex);
+
+        CLCD_I2C_Clear(&LCD1);
+
+        if (local.state == STATE_START) {
+            CLCD_I2C_SetCursor(&LCD1, 0, 0);
+            CLCD_I2C_WriteString(&LCD1, " KEO BUA BAO ");
+            CLCD_I2C_SetCursor(&LCD1, 0, 1);
+            CLCD_I2C_WriteString(&LCD1, "BAM NUT CHOI");
+        }
+        else if (local.state == STATE_PLAYING) {
+            CLCD_I2C_SetCursor(&LCD1, 0, 0);
+            snprintf(line, sizeof(line), "R%02lu T:%lu S:%lu-%lu",
+                     local.round, local.time_left,
+                     local.score_user, local.score_cpu);
+            CLCD_I2C_WriteString(&LCD1, line);
+
+            CLCD_I2C_SetCursor(&LCD1, 0, 1);
+            CLCD_I2C_WriteString(&LCD1, "PB14 PA10 PA15");
+        }
+        else if (local.state == STATE_SHOW_RESULT) {
+            CLCD_I2C_SetCursor(&LCD1, 0, 0);
+            snprintf(line, sizeof(line), "U:%s C:%s",
+                     choice_text(local.user_choice),
+                     choice_text(local.cpu_choice));
+            CLCD_I2C_WriteString(&LCD1, line);
+
+            CLCD_I2C_SetCursor(&LCD1, 0, 1);
+            if (local.last_result > 0) {
+                CLCD_I2C_WriteString(&LCD1, "BAN THANG PA15");
+            } else if (local.last_result < 0) {
+                CLCD_I2C_WriteString(&LCD1, "BAN THUA  PA15");
+            } else {
+                CLCD_I2C_WriteString(&LCD1, "HOA      PA15");
+            }
+        }
+        else if (local.state == STATE_FINISH) {
+            CLCD_I2C_SetCursor(&LCD1, 0, 0);
+            snprintf(line, sizeof(line), "END  %lu-%lu",
+                     local.score_user, local.score_cpu);
+            CLCD_I2C_WriteString(&LCD1, line);
+
+            CLCD_I2C_SetCursor(&LCD1, 0, 1);
+            if (local.score_user > local.score_cpu) {
+                CLCD_I2C_WriteString(&LCD1, "WIN! BAM RESTART");
+            } else if (local.score_user < local.score_cpu) {
+                CLCD_I2C_WriteString(&LCD1, "LOSE BAM RESTART");
+            } else {
+                CLCD_I2C_WriteString(&LCD1, "DRAW BAM RESTART");
+            }
+        }
+    }
+}
+
+void task_button(void *params)
+{
+    uint32_t btn;
+
+    for (;;) {
+        xQueueReceive(qbutton_hd, &btn, portMAX_DELAY);
+
+        // Bao hieu da nhan nut: LED PC13 dao trang thai
+        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+
+        xSemaphoreTake(data_mutex, portMAX_DELAY);
+        GameState st = game.state;
+        xSemaphoreGive(data_mutex);
+
+        if (st == STATE_START || st == STATE_FINISH) {
+            start_new_game();
+        }
+        else if (st == STATE_PLAYING) {
+            RpsChoice c = btn_to_choice(btn);
+            if (c != RPS_NONE) {
+                finish_round(c);
+            }
+        }
+        else if (st == STATE_SHOW_RESULT) {
+            // PA15 de sang luot tiep. Bam nut khac cung cho qua luot de de test.
+            next_round_or_finish();
+        }
+    }
+}
+
+void task_game(void *params)
+{
+    for (;;) {
+        xSemaphoreTake(game_sem, portMAX_DELAY);
+
+        xSemaphoreTake(data_mutex, portMAX_DELAY);
+        if (game.state == STATE_PLAYING) {
+            if (game.time_left > 0) {
+                game.time_left--;
+            }
+
+            if (game.time_left == 0) {
+                // Het gio: user thua luot do
+                game.user_choice = RPS_NONE;
+                game.cpu_choice = random_cpu_choice();
+                game.last_result = -1;
+                game.score_cpu++;
+                game.state = STATE_SHOW_RESULT;
+                xTimerStop(game_timer_hd, 0);
+            }
+        }
+        xSemaphoreGive(data_mutex);
+
+        xSemaphoreGive(lcd_sem);
+    }
+}
+
+void timer_game_callback(TimerHandle_t xTimer)
+{
+    xSemaphoreGive(game_sem);
+}
+
+void check_LCD_address(I2C_HandleTypeDef *hi2c, const uint8_t addr, int trials, int timeout)
+{
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
+    if (HAL_I2C_IsDeviceReady(hi2c, addr, trials, timeout) == HAL_OK) {
+        for (int i = 0; i < 10; i++) {
+            HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+            HAL_Delay(50);
+        }
+    } else {
+        for (int i = 0; i < 6; i++) {
+            HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+            HAL_Delay(300);
+        }
+    }
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
+}
+
+void EXTI15_10_IRQHandler(void)
+{
+    if (__HAL_GPIO_EXTI_GET_IT(GPIO_PIN_10)) {
+        HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_10);
+    }
+    if (__HAL_GPIO_EXTI_GET_IT(GPIO_PIN_14)) {
+        HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_14);
+    }
+    if (__HAL_GPIO_EXTI_GET_IT(GPIO_PIN_15)) {
+        HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_15);
+    }
+}
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    BaseType_t xHPTW = pdFALSE;
+    static uint32_t last_tick = 0;
+    uint32_t now = xTaskGetTickCountFromISR();
+
+    // debounce 150 ms
+    if ((now - last_tick) > pdMS_TO_TICKS(150)) {
+        last_tick = now;
+
+        uint32_t btn = BTN_INVALID;
+        if (GPIO_Pin == GPIO_PIN_14) {
+            btn = BTN_KEO;      // PB14
+        } else if (GPIO_Pin == GPIO_PIN_10) {
+            btn = BTN_BUA;      // PA10
+        } else if (GPIO_Pin == GPIO_PIN_15) {
+            btn = BTN_BAO;      // PA15
+        }
+
+        if (btn != BTN_INVALID && qbutton_hd != NULL) {
+            xQueueSendFromISR(qbutton_hd, &btn, &xHPTW);
+        }
+
+        portYIELD_FROM_ISR(xHPTW);
+    }
+}
+
+void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+    RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+    RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+    RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+
+    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
+        Error_Handler();
+    }
+
+    RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK |
+                                  RCC_CLOCKTYPE_SYSCLK |
+                                  RCC_CLOCKTYPE_PCLK1 |
+                                  RCC_CLOCKTYPE_PCLK2;
+    RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+    RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK) {
+        Error_Handler();
+    }
+}
+
+static void MX_I2C1_Init(void)
+{
+    hi2c1.Instance = I2C1;
+    hi2c1.Init.ClockSpeed = 100000;
+    hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+    hi2c1.Init.OwnAddress1 = 0;
+    hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+    hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+    hi2c1.Init.OwnAddress2 = 0;
+    hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+    hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+
+    if (HAL_I2C_Init(&hi2c1) != HAL_OK) {
+        Error_Handler();
+    }
+}
+
+static void MX_GPIO_Init(void)
+{
+    GPIO_InitTypeDef InitStruct = {0};
+
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+
+    // PC13 LED output
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
+    InitStruct.Pin = GPIO_PIN_13;
+    InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    InitStruct.Pull = GPIO_NOPULL;
+    InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOC, &InitStruct);
+
+    // PA10, PA15 input interrupt falling
+    InitStruct.Pin = GPIO_PIN_10 | GPIO_PIN_15;
+    InitStruct.Mode = GPIO_MODE_IT_FALLING;
+    InitStruct.Pull = GPIO_PULLUP;
+    HAL_GPIO_Init(GPIOA, &InitStruct);
+
+    // PB14 input interrupt falling
+    InitStruct.Pin = GPIO_PIN_14;
+    InitStruct.Mode = GPIO_MODE_IT_FALLING;
+    InitStruct.Pull = GPIO_PULLUP;
+    HAL_GPIO_Init(GPIOB, &InitStruct);
+
+    HAL_NVIC_SetPriority(EXTI15_10_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+}
+
+void Error_Handler(void)
+{
+    __disable_irq();
+    while (1) {
+        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+        HAL_Delay(200);
+    }
+}
+
+#ifdef USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line)
+{
+}
+#endif

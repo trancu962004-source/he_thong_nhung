@@ -1,0 +1,24 @@
+#ifndef RPS_SYMBOLS_H
+#define RPS_SYMBOLS_H
+
+#include <stdint.h>
+
+#define RPS_ROCK      0
+#define RPS_PAPER     1
+#define RPS_SCISSORS  2
+#define RPS_UNKNOWN   3
+#define RPS_EMPTY     4
+#define RPS_WIN       5
+#define RPS_LOSE      6
+#define RPS_DRAW      7
+
+extern uint8_t RPS_rock[8];
+extern uint8_t RPS_paper[8];
+extern uint8_t RPS_scissors[8];
+extern uint8_t RPS_unknown[8];
+extern uint8_t RPS_empty[8];
+extern uint8_t RPS_win[8];
+extern uint8_t RPS_lose[8];
+extern uint8_t RPS_draw[8];
+
+#endif
